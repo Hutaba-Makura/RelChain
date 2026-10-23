@@ -1,0 +1,41 @@
+[build-system]
+requires = ["setuptools>=75", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "relchain"
+version = "0.1.0"
+description = "Evidence-traceable three-layer long-term memory for LLM applications"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+  "httpx>=0.26,<1",
+  "networkx>=3.4,<4",
+  "pydantic>=2.10,<3",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.4,<9", "pytest-cov>=6,<7"]
+
+[project.scripts]
+relchain = "relchain.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
+addopts = "-q"
+
+[tool.isort]
+profile = "black"
+
+[tool.coverage.run]
+source = ["relchain"]
+branch = true
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = true
+
