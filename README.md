@@ -22,6 +22,22 @@ relchain query --db data/relchain.db --question "旅行で好むホテルの立�
 pytest
 ```
 
+LoCoMo sample 0（1会話、全QA）をOpenAI互換のQwen3 8Bサーバーで実行する場合：
+
+```powershell
+$env:RELCHAIN_LLM_API_KEY = "必要な場合のみ設定"
+relchain locomo `
+  --dataset C:/Users/syaro/Workspaces/MAGMA/data/locomo10.json `
+  --sample 0 `
+  --db data/locomo_qwen3_8b_sample0.db `
+  --output results/locomo_qwen3_8b_sample0.jsonl `
+  --relation-mode hybrid `
+  --base-url http://localhost:8000/v1 `
+  --model Qwen/Qwen3-8B
+```
+
+最初は `--max-questions 3` でsmoke testし、その後オプションを外すとsample 0の199問を再開可能なJSONLとして保存します。
+
 入力は1行1発話の JSON Lines です。
 
 ```json

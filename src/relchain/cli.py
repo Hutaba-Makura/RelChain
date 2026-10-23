@@ -2,11 +2,14 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from pathlib import Path
 from typing import Any
 
 from .config import MemoryConfig, RelationMode
 from .evaluation import relation_statistics
+from .llm import LLMAnswerGenerator, OpenAICompatibleTransport, ValidatedJSONCaller
+from .locomo import LoCoMoRunner, load_locomo_sample
 from .models import ConversationTurn
 from .pipeline import MemorySystem
 from .storage import SQLiteMemoryStore
@@ -102,6 +105,55 @@ def command_relation_stats(args: argparse.Namespace) -> None:
     _print(relation_statistics(store.list_relations()))
 
 
+def command_locomo(args: argparse.Namespace) -> None:
+    api_key = os.getenv(args.api_key_env) if args.api_key_env else None
+    transport = OpenAICompatibleTransport(
+        base_url=args.base_url,
+        model=args.model,
+        api_key=api_key,
+        timeout_seconds=args.timeout,
+        seed=args.seed,
+        extra_body={"chat_template_kwargs": {"enable_thinking": False}},
+    )
+    runner = LoCoMoRunner(
+        database=args.db,
+        relation_mode=RelationMode(args.relation_mode),
+        reader_name=args.model,
+        answer_generator=LLMAnswerGenerator(ValidatedJSONCaller(transport)),
+        context_token_budget=args.context_tokens,
+    )
+    turns, questions, sample_id = load_locomo_sample(args.dataset, args.sample)
+    report = runner.prepare(turns)
+    if args.prepare_only:
+        _print(
+            {
+                "sample_id": sample_id,
+                "turns": len(turns),
+                "questions": len(questions),
+                "ingest": {
+                    "new_turns": len(report.turn_ids),
+                    "new_events": len(report.event_ids),
+                    "affected_episodes": len(report.episode_ids),
+                    "relations": len(report.relation_ids),
+                    "state_updates": len(report.transitions),
+                    "failures": report.failures,
+                },
+            }
+        )
+        return
+    run_id = f"locomo-{sample_id}-{args.relation_mode}-{args.model}"
+    result = runner.answer_questions(
+        questions=questions,
+        output_path=args.output,
+        run_id=run_id,
+        max_questions=args.max_questions,
+    )
+    result["sample_id"] = sample_id
+    result["turn_count"] = len(turns)
+    result["question_count"] = len(questions)
+    _print(result)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="relchain")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -147,6 +199,29 @@ def build_parser() -> argparse.ArgumentParser:
     )
     stats.add_argument("--db", type=Path, required=True)
     stats.set_defaults(handler=command_relation_stats)
+
+    locomo = subparsers.add_parser(
+        "locomo",
+        help="run one LoCoMo conversation with an OpenAI-compatible Qwen reader",
+    )
+    locomo.add_argument("--dataset", type=Path, required=True)
+    locomo.add_argument("--sample", type=int, default=0)
+    locomo.add_argument("--db", type=Path, required=True)
+    locomo.add_argument("--output", type=Path, required=True)
+    locomo.add_argument(
+        "--relation-mode",
+        choices=[item.value for item in RelationMode],
+        default="hybrid",
+    )
+    locomo.add_argument("--base-url", required=True)
+    locomo.add_argument("--model", default="Qwen/Qwen3-8B")
+    locomo.add_argument("--api-key-env", default="RELCHAIN_LLM_API_KEY")
+    locomo.add_argument("--max-questions", type=int)
+    locomo.add_argument("--context-tokens", type=int, default=4096)
+    locomo.add_argument("--timeout", type=float, default=180.0)
+    locomo.add_argument("--seed", type=int, default=0)
+    locomo.add_argument("--prepare-only", action="store_true")
+    locomo.set_defaults(handler=command_locomo)
     return parser
 
 

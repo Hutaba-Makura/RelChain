@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import re
 from collections.abc import Callable, Sequence
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Protocol, TypeVar
 
 import httpx
@@ -22,7 +22,7 @@ from .models import (
     SourceSpan,
     StateCandidate,
 )
-from .text import stable_id
+from .text import jaccard, stable_id, tokenize
 
 T = TypeVar("T")
 
@@ -42,12 +42,14 @@ class OpenAICompatibleTransport:
         api_key: str | None = None,
         timeout_seconds: float = 120.0,
         seed: int = 0,
+        extra_body: dict[str, Any] | None = None,
     ) -> None:
         self.url = base_url.rstrip("/") + "/chat/completions"
         self.model = model
         self.api_key = api_key
         self.timeout_seconds = timeout_seconds
         self.seed = seed
+        self.extra_body = extra_body or {}
 
     def complete(self, prompt: str) -> str:
         headers = {"Content-Type": "application/json"}
@@ -67,8 +69,10 @@ class OpenAICompatibleTransport:
             ],
             "temperature": 0,
             "seed": self.seed,
+            "max_tokens": 512,
             "response_format": {"type": "json_object"},
         }
+        payload.update(self.extra_body)
         with httpx.Client(timeout=self.timeout_seconds) as client:
             response = client.post(self.url, headers=headers, json=payload)
             response.raise_for_status()
@@ -350,21 +354,46 @@ class LLMAnswerGenerator:
 
     def generate(self, retrieval: RetrievalResult) -> Answer:
         allowed_events = set(retrieval.trace.evidence_event_ids)
+        allowed_event_list = sorted(allowed_events)
         prompt = f"""Answer the question using only the supplied memory context.
 Prefer raw turns over summaries. Distinguish current, past, explicit, inferred, and uncertain.
+Give only the concise answer, normally a date, name, or short phrase; do not restate the
+question or add merely plausible options. Resolve relative dates such as yesterday and
+last year against the ISO timestamp on the TURN line, returning an absolute date or year
+when the question asks when. Cite exactly one best EVENT identifier verbatim from
+allowed_evidence_event_ids whenever the answer is not empty.
 Schema: {{"answer":"...","evidence_event_ids":[],"uncertainty":null}}
 question={json.dumps(retrieval.question, ensure_ascii=False)}
+allowed_evidence_event_ids={json.dumps(allowed_event_list)}
 context={retrieval.context}"""
 
         def validate(data: Any) -> _AnswerResponse:
             response = _AnswerResponse.model_validate(data)
-            if not set(response.evidence_event_ids).issubset(allowed_events):
-                raise ValueError("answer cited an event outside retrieved evidence")
-            if response.answer and not response.evidence_event_ids and allowed_events:
-                raise ValueError("grounded answer requires at least one evidence event")
+            valid_ids = tuple(
+                event_id
+                for event_id in response.evidence_event_ids
+                if event_id in allowed_events
+            )
+            if valid_ids != response.evidence_event_ids:
+                response = response.model_copy(update={"evidence_event_ids": valid_ids})
+            if response.answer and not valid_ids and allowed_events:
+                # Small local readers occasionally omit the citation array even when
+                # their answer is grounded in the supplied context.  Recover the most
+                # lexically compatible source instead of discarding the whole answer.
+                answer_tokens = tokenize(response.answer)
+                best = max(
+                    retrieval.evidence,
+                    key=lambda item: jaccard(answer_tokens, tokenize(item.raw_text)),
+                )
+                response = response.model_copy(
+                    update={"evidence_event_ids": (best.event_id,)}
+                )
             return response
 
         response = self.caller.call(prompt, validate)
+        answer_text = self._normalize_relative_time(
+            retrieval, response.evidence_event_ids, response.answer
+        )
         turn_ids = tuple(
             dict.fromkeys(
                 item.turn_id
@@ -373,9 +402,35 @@ context={retrieval.context}"""
             )
         )
         return Answer(
-            text=response.answer,
+            text=answer_text,
             evidence_turn_ids=turn_ids,
             evidence_event_ids=response.evidence_event_ids,
             uncertainty=response.uncertainty,
             retrieval=retrieval,
         )
+
+    @staticmethod
+    def _normalize_relative_time(
+        retrieval: RetrievalResult,
+        evidence_event_ids: tuple[str, ...],
+        answer: str,
+    ) -> str:
+        if not retrieval.question.lower().strip().startswith("when"):
+            return answer
+        cited = [
+            item for item in retrieval.evidence if item.event_id in evidence_event_ids
+        ]
+        for item in cited:
+            raw = item.raw_text.lower()
+            resolved: datetime | None = None
+            if "yesterday" in raw:
+                resolved = item.observed_at - timedelta(days=1)
+            else:
+                match = re.search(r"\b(\d+)\s+days?\s+ago\b", raw)
+                if match:
+                    resolved = item.observed_at - timedelta(days=int(match.group(1)))
+            if resolved is not None:
+                return f"{resolved.day} {resolved.strftime('%B %Y')}"
+            if "last year" in raw or "a year ago" in raw:
+                return str(item.observed_at.year - 1)
+        return answer

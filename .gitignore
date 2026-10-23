@@ -10,6 +10,7 @@ build/
 *.egg-info/
 data/
 results/
+models/
 *.db
 *.sqlite
 *.sqlite3

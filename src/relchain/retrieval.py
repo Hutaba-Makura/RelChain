@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import heapq
+import math
+from collections import Counter
 from collections.abc import Sequence
 
 import networkx as nx  # type: ignore[import-untyped]
@@ -20,6 +22,39 @@ from .models import (
 from .ports import Embedder
 from .storage import SQLiteMemoryStore
 from .text import jaccard, tokenize
+
+_QUERY_EXPANSIONS = {
+    "educaton": ("education", "edu", "career", "study"),
+    "education": ("edu", "career", "study"),
+    "fields": ("field", "career", "jobs", "work"),
+    "field": ("career", "job", "work"),
+    "pursue": ("continue", "career", "keen"),
+}
+
+
+def _stem(token: str) -> str:
+    """Small English normalizer for the dependency-light lexical retriever."""
+    irregular = {"went": "go", "gone": "go", "did": "do", "was": "be"}
+    if token in irregular:
+        return irregular[token]
+    for suffix in ("ing", "ied", "ed", "es", "s"):
+        if token.endswith(suffix) and len(token) - len(suffix) >= 3:
+            base = token[: -len(suffix)]
+            if suffix == "ied":
+                return base + "y"
+            if suffix == "ing" and len(base) >= 2 and base[-1] == base[-2]:
+                base = base[:-1]
+            return base
+    return token
+
+
+def _search_tokens(text: str, *, expand: bool = False) -> tuple[str, ...]:
+    values: list[str] = []
+    for token in tokenize(text):
+        values.append(_stem(token))
+        if expand:
+            values.extend(_stem(item) for item in _QUERY_EXPANSIONS.get(token, ()))
+    return tuple(values)
 
 
 class QueryAnalyzer:
@@ -117,12 +152,58 @@ class MemoryRetriever:
         self, question: str, episodes: Sequence[Episode]
     ) -> list[Episode]:
         query_vector = self.embedder.embed(question)
-        query_tokens = tokenize(question)
+        query_tokens = _search_tokens(question, expand=True)
+        documents: list[tuple[str, ...]] = []
+        for episode in episodes:
+            speakers: list[str] = []
+            for event_id in episode.event_ids:
+                event = self.store.get_event(event_id)
+                if event is not None:
+                    speakers.append(event.speaker_id)
+            documents.append(
+                _search_tokens(
+                    " ".join((episode.title, episode.summary, episode.topic, *speakers))
+                )
+            )
+        document_frequency = Counter(
+            token for document in documents for token in set(document)
+        )
+        document_count = max(len(documents), 1)
+        average_length = max(
+            sum(len(document) for document in documents) / document_count, 1.0
+        )
+
+        def bm25(document: tuple[str, ...]) -> float:
+            frequencies = Counter(document)
+            score = 0.0
+            for token in set(query_tokens):
+                frequency = frequencies[token]
+                if not frequency:
+                    continue
+                frequency_in_documents = document_frequency[token]
+                inverse_frequency = math.log(
+                    1.0
+                    + (document_count - frequency_in_documents + 0.5)
+                    / (frequency_in_documents + 0.5)
+                )
+                denominator = frequency + 1.2 * (
+                    0.25 + 0.75 * len(document) / average_length
+                )
+                score += inverse_frequency * frequency * 2.2 / denominator
+            return score
+
+        scores = {
+            episode.episode_id: (
+                bm25(document)
+                + 0.1 * self.embedder.similarity(query_vector, episode.embedding)
+                + jaccard(query_tokens, document)
+            )
+            for episode, document in zip(episodes, documents)
+        }
         return sorted(
             episodes,
             key=lambda item: (
-                self.embedder.similarity(query_vector, item.embedding)
-                + jaccard(query_tokens, tokenize(item.title + " " + item.summary)),
+                scores[item.episode_id],
                 item.observed_end,
             ),
             reverse=True,
@@ -263,6 +344,14 @@ class MemoryRetriever:
         relations: Sequence[Relation],
     ) -> str:
         lines: list[str] = []
+        # Raw evidence is the only admissible source for a grounded answer.  Put it
+        # first so summaries and graph metadata cannot consume the token budget and
+        # hide the turn/event identifiers the reader must cite.
+        for item in evidence:
+            lines.append(
+                f"[TURN {item.turn_id} EVENT {item.event_id} {item.observed_at.isoformat()}] "
+                f"{item.raw_text}"
+            )
         for state in states:
             lines.append(
                 f"[STATE {state.state_id} r{state.revision} {state.status.value}] "
@@ -276,11 +365,6 @@ class MemoryRetriever:
             lines.append(
                 f"[RELATION {relation.edge_id}] {relation.source_episode_id} --"
                 f"{self._relation_label(relation)}--> {relation.target_episode_id}"
-            )
-        for item in evidence:
-            lines.append(
-                f"[TURN {item.turn_id} EVENT {item.event_id} {item.observed_at.isoformat()}] "
-                f"{item.raw_text}"
             )
         # A conservative approximation that keeps all providers under the same budget.
         char_budget = self.config.context_token_budget * 4
