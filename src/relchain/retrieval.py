@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import heapq
 import math
+from time import perf_counter
 from collections import Counter
 from collections.abc import Sequence
 
@@ -108,6 +109,7 @@ class MemoryRetriever:
         self.token_counter = token_counter or ApproximateTokenCounter()
 
     def retrieve(self, question: str) -> RetrievalResult:
+        started = perf_counter()
         intent = self.analyzer.analyze(question)
         episodes = self.store.list_episodes()
         states = self._rank_states(question, intent)
@@ -127,7 +129,10 @@ class MemoryRetriever:
             question, intent, ranked[: self.config.max_episodes], self.store.list_relations()
         )
         evidence = self._backtrack(selected)
+        search_seconds = perf_counter() - started
+        context_started = perf_counter()
         context, context_ids = self._context(question, states, selected, evidence, traversed)
+        context_seconds = perf_counter() - context_started
         trace = RetrievalTrace(
             question=question,
             intent=intent,
@@ -142,6 +147,8 @@ class MemoryRetriever:
                 self._relation_label(item) for item in traversed
             ),
             inspected_edge_ids=tuple(inspected),
+            search_seconds=search_seconds,
+            context_build_seconds=context_seconds,
             **context_ids,
         )
         self.store.log_retrieval(trace)

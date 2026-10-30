@@ -17,6 +17,7 @@ from .models import ConversationTurn
 from .pipeline import MemorySystem
 from .storage import SQLiteMemoryStore
 from .tokens import ApproximateTokenCounter, TransformersTokenCounter
+from .quick_commands import register_quick_commands
 
 
 def _print(value: Any) -> None:
@@ -264,6 +265,7 @@ def command_locomo(args: argparse.Namespace) -> None:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="relchain")
     subparsers = parser.add_subparsers(dest="command", required=True)
+    register_quick_commands(subparsers)
 
     init = subparsers.add_parser("init", help="initialize a mode-isolated database")
     init.add_argument("--db", type=Path, required=True)

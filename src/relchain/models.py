@@ -222,6 +222,8 @@ class RetrievalTrace(FrozenModel):
     retrieved_turn_refs: tuple[str, ...] = ()
     context_turn_refs: tuple[str, ...] = ()
     excluded_turn_ids: tuple[str, ...] = ()
+    search_seconds: float | None = None
+    context_build_seconds: float | None = None
 
 
 class RetrievalResult(FrozenModel):
@@ -256,3 +258,5 @@ class IngestReport(FrozenModel):
     state_ids: tuple[str, ...]
     transitions: tuple[StateTransition, ...]
     failures: tuple[str, ...] = ()
+    timings_seconds: dict[str, float] = Field(default_factory=dict)
+    counts: dict[str, int] = Field(default_factory=dict)

@@ -2,9 +2,37 @@ from __future__ import annotations
 
 import hashlib
 import math
+from time import perf_counter
 from collections.abc import Sequence
 
 from .text import tokenize
+from .ports import Embedder
+
+
+class MeasuredEmbedder:
+    def __init__(self, delegate: Embedder) -> None:
+        self.delegate = delegate
+        self.name = delegate.name
+        self.embed_seconds = 0.0
+        self.embed_calls = 0
+        self.similarity_seconds = 0.0
+        self.similarity_calls = 0
+
+    def embed(self, text: str) -> tuple[float, ...]:
+        start = perf_counter()
+        try:
+            return self.delegate.embed(text)
+        finally:
+            self.embed_seconds += perf_counter() - start
+            self.embed_calls += 1
+
+    def similarity(self, left: Sequence[float], right: Sequence[float]) -> float:
+        start = perf_counter()
+        try:
+            return self.delegate.similarity(left, right)
+        finally:
+            self.similarity_seconds += perf_counter() - start
+            self.similarity_calls += 1
 
 
 class HashingEmbedder:

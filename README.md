@@ -67,3 +67,5 @@ relchain locomo `
 標準実装のEvent抽出、Episode分割、State抽出、関係名、回答はオフラインの決定的処理です。`locomo` CLIは回答に指定したLLMを使い、関係名は既定で決定的生成です。`--relation-generation llm` を選んだFree / Hybridのみ、別途関係生成LLMを接続します。抽出・分割・State処理は変えません。研究比較の手順、指標、互換性、FakeTransportでの確認方法は [研究実験手順](docs/research-experiment.md) を参照してください。
 
 詳細は [技術スタック](docs/technical-stack.md)、[構成](docs/architecture.md)、[実装プラン](docs/implementation-plan.md)、[各機能](docs/feature-implementation.md)、[テスト](docs/testing.md) を参照してください。
+
+日常の改善確認には [短時間評価の手順](docs/quick-evaluation.md) を使えます。固定質問セットを作り、全履歴の記憶・KG、検索、回答、採点を段階別に保存・再開します。`smoke` は1会話で最大10問、`dev60` は2会話で最大60問を選びます。実際の件数はデータの不足に応じてmanifestに記録されます。

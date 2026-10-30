@@ -51,6 +51,9 @@ class OpenAICompatibleTransport:
         self.timeout_seconds = timeout_seconds
         self.seed = seed
         self.extra_body = extra_body or {}
+        self.request_count = 0
+        self.prompt_tokens: int | None = 0
+        self.completion_tokens: int | None = 0
 
     def complete(self, prompt: str) -> str:
         headers = {"Content-Type": "application/json"}
@@ -75,9 +78,20 @@ class OpenAICompatibleTransport:
         }
         payload.update(self.extra_body)
         with httpx.Client(timeout=self.timeout_seconds) as client:
+            self.request_count += 1
             response = client.post(self.url, headers=headers, json=payload)
             response.raise_for_status()
         body = response.json()
+        usage = body.get("usage", {})
+        if isinstance(usage, dict):
+            if isinstance(usage.get("prompt_tokens"), int) and self.prompt_tokens is not None:
+                self.prompt_tokens += usage["prompt_tokens"]
+            else:
+                self.prompt_tokens = None
+            if isinstance(usage.get("completion_tokens"), int) and self.completion_tokens is not None:
+                self.completion_tokens += usage["completion_tokens"]
+            else:
+                self.completion_tokens = None
         try:
             return str(body["choices"][0]["message"]["content"])
         except (KeyError, IndexError, TypeError) as exc:
@@ -91,12 +105,16 @@ class ValidatedJSONCaller:
 
     def __init__(self, transport: JSONTransport) -> None:
         self.transport = transport
+        self.call_count = 0
+        self.retry_count = 0
 
     def call(self, prompt: str, validator: Callable[[Any], T]) -> T:
+        self.call_count += 1
         error = ""
         for attempt in range(2):
             current = prompt
             if attempt:
+                self.retry_count += 1
                 current += (
                     "\nYour previous output was invalid. Correct it without changing "
                     f"the evidence. Validation error: {error}"
@@ -362,6 +380,8 @@ class LLMAnswerGenerator:
         self.caller = caller
         self.token_counter = token_counter or ApproximateTokenCounter()
         self.full_input_token_budget = full_input_token_budget
+        self.call_count = 0
+        self.retry_count = 0
 
     def _prompt(self, retrieval: RetrievalResult) -> str:
         allowed_event_list = sorted(retrieval.trace.context_event_ids)
@@ -421,12 +441,15 @@ context={retrieval.context}"""
             current = current.model_copy(update={"context": context, "trace": trace})
 
     def generate(self, retrieval: RetrievalResult) -> Answer:
+        self.call_count += 1
         retrieval, prompt, prompt_count, prompt_method = self._fit_prompt(retrieval)
         allowed_events = set(retrieval.trace.context_event_ids)
         raw = ""
         response: _AnswerResponse | None = None
         status = "citation_validation_failed"
         for attempt in range(2):
+            if attempt:
+                self.retry_count += 1
             current_prompt = prompt if not attempt else prompt + "\nYour previous output was invalid. Correct the citations using only allowed_evidence_event_ids."
             if self.full_input_token_budget is not None:
                 retry_count, _ = self._input_count(current_prompt)

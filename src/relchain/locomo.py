@@ -38,6 +38,12 @@ def load_locomo_sample(
     payload = json.loads(Path(dataset_path).read_text(encoding="utf-8"))
     if not isinstance(payload, list):
         payload = payload.get("samples", [])
+    return load_locomo_sample_data(payload, sample_index)
+
+
+def load_locomo_sample_data(
+    payload: list[dict[str, Any]], sample_index: int
+) -> tuple[list[ConversationTurn], list[dict[str, Any]], str]:
     if sample_index < 0 or sample_index >= len(payload):
         raise IndexError(
             f"LoCoMo sample index {sample_index} is outside 0..{len(payload)-1}"
@@ -212,6 +218,8 @@ class LoCoMoRunner:
                     prompt_token_count=answer.prompt_token_count,
                     prompt_token_method=answer.prompt_token_method,
                     information_not_found=answer.response_status == "information_not_found" or answer.uncertainty == "information_not_found",
+                    adversarial_abstention_correct=(answer.citation_status == "valid_abstention")
+                    if str(item.get("category", "")) == "5" else None,
                 )
                 logger.append(record)
                 added += 1

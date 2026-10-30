@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import math
+import hashlib
+import json
 from typing import Protocol
 
 
@@ -30,7 +32,12 @@ class TransformersTokenCounter:
         self.tokenizer = AutoTokenizer.from_pretrained(
             tokenizer_path, local_files_only=True, trust_remote_code=False
         )
-        self.name = f"transformers:{tokenizer_path}"
+        fingerprint = hashlib.sha256(json.dumps({
+            "vocab": self.tokenizer.get_vocab(),
+            "chat_template": self.tokenizer.chat_template,
+            "special_tokens": self.tokenizer.special_tokens_map,
+        }, sort_keys=True, ensure_ascii=False, default=str).encode("utf-8")).hexdigest()[:16]
+        self.name = f"transformers:{tokenizer_path}:{fingerprint}"
 
     def count(self, text: str) -> int:
         return len(self.tokenizer.encode(text, add_special_tokens=False))

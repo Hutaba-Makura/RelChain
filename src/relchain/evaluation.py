@@ -107,6 +107,7 @@ class EvaluationRecord:
     memory_token_method: str | None = None
     prompt_token_count: int | None = None
     prompt_token_method: str | None = None
+    adversarial_abstention_correct: bool | None = None
     context_state_ids: tuple[str, ...] = ()
     context_episode_ids: tuple[str, ...] = ()
     context_relation_ids: tuple[str, ...] = ()
@@ -192,6 +193,10 @@ class EvaluationLogger:
                 "token_f1_evaluable_count": len(f1_values),
                 "information_not_found_rate": sum(item.information_not_found for item in group) / len(group) if group else None,
             }
+            abstentions = [item.adversarial_abstention_correct for item in group
+                           if item.adversarial_abstention_correct is not None]
+            result["adversarial_abstention_rate"] = sum(abstentions) / len(abstentions) if abstentions else None
+            result["adversarial_evaluable_count"] = len(abstentions)
             for prefix in ("retrieved", "context", "citation"):
                 values = [getattr(item, f"{prefix}_evidence_recall") for item in group]
                 valid = [value for value in values if value is not None]

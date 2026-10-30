@@ -2,10 +2,11 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from pathlib import Path
+from time import perf_counter
 
 from .answering import EvidenceExtractiveAnswerGenerator
 from .config import MemoryConfig
-from .embeddings import HashingEmbedder
+from .embeddings import HashingEmbedder, MeasuredEmbedder
 from .episodes import EpisodeBuilder
 from .extraction import RuleBasedEventExtractor, RuleBasedStateExtractor
 from .models import Answer, ConversationTurn, IngestReport, StateTransition
@@ -50,10 +51,12 @@ class MemorySystem:
                 f"(database={existing_mode}, requested={self.config.relation_mode.value})"
             )
         self.store.set_metadata("relation_mode", self.config.relation_mode.value)
-        self.store.set_metadata("writer_name", self.config.writer_name)
-        self.store.set_metadata("reader_name", self.config.reader_name)
-        self.store.set_metadata("embedding_name", self.config.embedding_name)
-        self.embedder = embedder or HashingEmbedder(name=self.config.embedding_name)
+        for key, value in (("writer_name", self.config.writer_name),
+                           ("reader_name", self.config.reader_name),
+                           ("embedding_name", self.config.embedding_name)):
+            if self.store.get_metadata(key) is None:
+                self.store.set_metadata(key, value)
+        self.embedder = MeasuredEmbedder(embedder or HashingEmbedder(name=self.config.embedding_name))
         self.event_extractor = event_extractor or RuleBasedEventExtractor()
         self.state_extractor = state_extractor or RuleBasedStateExtractor()
         self.episode_builder = EpisodeBuilder(
@@ -66,7 +69,13 @@ class MemorySystem:
         self.retriever = MemoryRetriever(self.store, self.embedder, self.config, token_counter)
         self.answer_generator = answer_generator or EvidenceExtractiveAnswerGenerator()
 
-    def ingest(self, turns: Sequence[ConversationTurn]) -> IngestReport:
+    def ingest(self, turns: Sequence[ConversationTurn], *, build_relations: bool = True) -> IngestReport:
+        started = perf_counter()
+        timings = {key: 0.0 for key in (
+            "event_extraction", "episode_construction", "state_update",
+            "candidate_graph", "relation_generation", "db_write",
+        )}
+        embed_before = self.embedder.embed_seconds
         new_turn_ids: list[str] = []
         new_event_ids: list[str] = []
         failures: list[str] = []
@@ -79,11 +88,17 @@ class MemorySystem:
                     continue
             try:
                 if existing is None:
+                    write_start = perf_counter()
                     self.store.save_turn(turn)
+                    timings["db_write"] += perf_counter() - write_start
+                stage_start = perf_counter()
                 events = self.event_extractor.extract(turn)
+                timings["event_extraction"] += perf_counter() - stage_start
                 if not events:
                     raise ValueError("extractor returned no grounded events")
+                write_start = perf_counter()
                 self.store.save_events(events)
+                timings["db_write"] += perf_counter() - write_start
                 if existing is None:
                     new_turn_ids.append(turn.turn_id)
                 new_event_ids.extend(item.event_id for item in events)
@@ -96,17 +111,28 @@ class MemorySystem:
         affected_episode_ids: set[str] = set()
         for conversation_id in affected_conversations:
             events = self.store.list_events(conversation_id)
+            stage_start = perf_counter()
             episodes = self.episode_builder.build(events)
+            timings["episode_construction"] += perf_counter() - stage_start
+            write_start = perf_counter()
             self.store.save_episodes(episodes)
+            timings["db_write"] += perf_counter() - write_start
             for episode in episodes:
                 if set(episode.event_ids) & set(new_event_ids):
                     affected_episode_ids.add(episode.episode_id)
 
         all_events = {item.event_id: item for item in self.store.list_events()}
         all_episodes = self.store.list_episodes()
-        if new_event_ids or (all_episodes and not self.store.list_relations()):
-            relations = self.relation_builder.build(all_episodes, all_events)
+        if build_relations and (new_event_ids or (all_episodes and not self.store.list_relations())):
+            stage_start = perf_counter()
+            candidates = self.relation_builder.candidate_pairs(all_episodes, all_events)
+            timings["candidate_graph"] += perf_counter() - stage_start
+            stage_start = perf_counter()
+            relations = self.relation_builder.build(all_episodes, all_events, candidates)
+            timings["relation_generation"] += perf_counter() - stage_start
+            write_start = perf_counter()
             self.store.replace_relations(self.config.relation_mode.value, relations)
+            timings["db_write"] += perf_counter() - write_start
         else:
             relations = self.store.list_relations()
 
@@ -117,16 +143,20 @@ class MemorySystem:
                 continue
             episode_events = [all_events[event_id] for event_id in episode.event_ids]
             try:
+                stage_start = perf_counter()
                 candidates = self.state_extractor.extract(episode, episode_events)
                 for candidate in candidates:
                     states, state_transitions = self.state_updater.apply(candidate)
                     changed_states.extend(item.state_id for item in states)
                     transitions.extend(state_transitions)
+                timings["state_update"] += perf_counter() - stage_start
             except Exception as exc:
                 message = f"{episode.episode_id}: {exc}"
                 failures.append(message)
                 self.store.record_failure("state_update", episode.episode_id, str(exc))
 
+        timings["embedding"] = self.embedder.embed_seconds - embed_before
+        timings["total"] = perf_counter() - started
         return IngestReport(
             turn_ids=tuple(new_turn_ids),
             event_ids=tuple(new_event_ids),
@@ -135,6 +165,11 @@ class MemorySystem:
             state_ids=tuple(dict.fromkeys(changed_states)),
             transitions=tuple(transitions),
             failures=tuple(failures),
+            timings_seconds=timings,
+            counts={"turns": self.store.counts()["turns"],
+                    "events": self.store.counts()["events"],
+                    "episodes": self.store.counts()["episodes"],
+                    "relations": self.store.counts()["relations"]},
         )
 
     def query(self, question: str) -> Answer:
