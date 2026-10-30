@@ -22,6 +22,7 @@ from .models import (
 from .ports import Embedder
 from .storage import SQLiteMemoryStore
 from .text import jaccard, tokenize
+from .tokens import ApproximateTokenCounter, TokenCounter
 
 _QUERY_EXPANSIONS = {
     "educaton": ("education", "edu", "career", "study"),
@@ -97,12 +98,14 @@ class QueryAnalyzer:
 
 class MemoryRetriever:
     def __init__(
-        self, store: SQLiteMemoryStore, embedder: Embedder, config: MemoryConfig
+        self, store: SQLiteMemoryStore, embedder: Embedder, config: MemoryConfig,
+        token_counter: TokenCounter | None = None,
     ) -> None:
         self.store = store
         self.embedder = embedder
         self.config = config
         self.analyzer = QueryAnalyzer()
+        self.token_counter = token_counter or ApproximateTokenCounter()
 
     def retrieve(self, question: str) -> RetrievalResult:
         intent = self.analyzer.analyze(question)
@@ -115,16 +118,16 @@ class MemoryRetriever:
             episode_id for state in states for episode_id in state.evidence_episode_ids
         }
         seed_map = {item.episode_id: item for item in seeds}
-        for episode_id in state_episode_ids:
+        for episode_id in sorted(state_episode_ids):
             item = self.store.get_episode(episode_id)
             if item is not None:
                 seed_map[item.episode_id] = item
-        selected, traversed = self._traverse(
-            question, intent, list(seed_map.values()), self.store.list_relations()
+        ranked = self._rank_episodes(question, list(seed_map.values()))
+        selected, traversed, inspected = self._traverse(
+            question, intent, ranked[: self.config.max_episodes], self.store.list_relations()
         )
-        selected = selected[: self.config.max_episodes]
         evidence = self._backtrack(selected)
-        context = self._context(states, selected, evidence, traversed)
+        context, context_ids = self._context(question, states, selected, evidence, traversed)
         trace = RetrievalTrace(
             question=question,
             intent=intent,
@@ -132,11 +135,14 @@ class MemoryRetriever:
             state_ids=tuple(item.state_id for item in states),
             traversed_edge_ids=tuple(item.edge_id for item in traversed),
             retrieved_episode_ids=tuple(item.episode_id for item in selected),
-            evidence_event_ids=tuple(item.event_id for item in evidence),
+            evidence_event_ids=tuple(dict.fromkeys(eid for item in evidence for eid in item.event_ids)),
             evidence_turn_ids=tuple(dict.fromkeys(item.turn_id for item in evidence)),
+            retrieved_turn_refs=tuple(f"{item.conversation_id}:{item.turn_id}" for item in evidence),
             relation_descriptions=tuple(
                 self._relation_label(item) for item in traversed
             ),
+            inspected_edge_ids=tuple(inspected),
+            **context_ids,
         )
         self.store.log_retrieval(trace)
         return RetrievalResult(
@@ -205,6 +211,7 @@ class MemoryRetriever:
             key=lambda item: (
                 scores[item.episode_id],
                 item.observed_end,
+                item.episode_id,
             ),
             reverse=True,
         )
@@ -238,7 +245,7 @@ class MemoryRetriever:
         intent: QueryIntent,
         seeds: Sequence[Episode],
         relations: Sequence[Relation],
-    ) -> tuple[list[Episode], list[Relation]]:
+    ) -> tuple[list[Episode], list[Relation], list[str]]:
         graph = nx.MultiDiGraph()
         for relation in relations:
             graph.add_edge(
@@ -256,6 +263,7 @@ class MemoryRetriever:
             )
         selected: dict[str, Episode] = {item.episode_id: item for item in seeds}
         traversed: list[Relation] = []
+        inspected: list[str] = []
         visited_edges: set[str] = set()
         frontier: list[tuple[float, int, str]] = []
         for seed in seeds:
@@ -263,6 +271,8 @@ class MemoryRetriever:
         while frontier and len(selected) < self.config.max_episodes:
             _, depth, node_id = heapq.heappop(frontier)
             if depth >= self.config.max_hops:
+                continue
+            if node_id not in graph:
                 continue
             neighbors = sorted(
                 (
@@ -275,6 +285,7 @@ class MemoryRetriever:
                 reverse=True,
             )[: self.config.neighbors_per_node]
             for neighbor_id, relation in neighbors:
+                inspected.append(relation.edge_id)
                 if relation.edge_id in visited_edges:
                     continue
                 visited_edges.add(relation.edge_id)
@@ -284,18 +295,20 @@ class MemoryRetriever:
                 episode = self.store.get_episode(neighbor_id)
                 if episode is None:
                     continue
-                traversed.append(relation)
                 if neighbor_id not in selected:
+                    if len(selected) >= self.config.max_episodes:
+                        break
                     selected[neighbor_id] = episode
+                    traversed.append(relation)
                     heapq.heappush(frontier, (-score, depth + 1, neighbor_id))
-        return list(selected.values()), traversed
+        return list(selected.values()), traversed, inspected
 
     def _edge_score(
         self, question: str, intent: QueryIntent, relation: Relation
     ) -> float:
         score = relation.confidence
         if relation.category in intent.preferred_categories:
-            score += 1.0
+            score += self.config.category_boost
         semantic = jaccard(
             tokenize(question),
             tokenize(relation.relation_text + " " + relation.description),
@@ -304,7 +317,7 @@ class MemoryRetriever:
 
     def _backtrack(self, episodes: Sequence[Episode]) -> list[EvidenceItem]:
         evidence: list[EvidenceItem] = []
-        seen_turns: set[tuple[str, str]] = set()
+        turn_items: dict[tuple[str, str], EvidenceItem] = {}
         for episode in episodes:
             for event_id in episode.event_ids:
                 event = self.store.get_event(event_id)
@@ -314,13 +327,18 @@ class MemoryRetriever:
                 if turn is None:
                     continue
                 key = (event.conversation_id, event.turn_id)
-                if key in seen_turns:
+                if key in turn_items:
+                    prior = turn_items[key]
+                    turn_items[key] = prior.model_copy(update={
+                        "event_ids": tuple(dict.fromkeys((*prior.event_ids, event.event_id)))
+                    })
                     continue
-                seen_turns.add(key)
-                evidence.append(
+                turn_items[key] = (
                     EvidenceItem(
+                        conversation_id=turn.conversation_id,
                         turn_id=turn.turn_id,
                         event_id=event.event_id,
+                        event_ids=(event.event_id,),
                         episode_id=episode.episode_id,
                         speaker_id=turn.speaker_id,
                         observed_at=turn.observed_at,
@@ -329,7 +347,7 @@ class MemoryRetriever:
                         source_end=event.source_span.end,
                     )
                 )
-        return sorted(evidence, key=lambda item: (item.observed_at, item.turn_id))
+        return sorted(turn_items.values(), key=lambda item: (item.observed_at, item.conversation_id, item.turn_id))
 
     @staticmethod
     def _relation_label(relation: Relation) -> str:
@@ -338,41 +356,64 @@ class MemoryRetriever:
 
     def _context(
         self,
+        question: str,
         states: Sequence[UserState],
         episodes: Sequence[Episode],
         evidence: Sequence[EvidenceItem],
         relations: Sequence[Relation],
-    ) -> str:
-        lines: list[str] = []
-        # Raw evidence is the only admissible source for a grounded answer.  Put it
-        # first so summaries and graph metadata cannot consume the token budget and
-        # hide the turn/event identifiers the reader must cite.
-        for item in evidence:
-            lines.append(
-                f"[TURN {item.turn_id} EVENT {item.event_id} {item.observed_at.isoformat()}] "
-                f"{item.raw_text}"
-            )
+    ) -> tuple[str, dict[str, object]]:
+        # Select whole records by a common deterministic ranking, then display raw
+        # turns chronologically. A large record cannot block smaller later records.
+        rank = {episode.episode_id: index for index, episode in enumerate(episodes)}
+        candidates: list[tuple[str, str, str, object]] = []
+        for item in sorted(evidence, key=lambda x: (rank.get(x.episode_id, 999999), x.turn_id)):
+            ids = ",".join(item.event_ids)
+            line = f"[TURN {item.turn_id} EVENTS {ids} {item.observed_at.isoformat()}] {item.raw_text.replace(chr(10), r'\n')}"
+            candidates.append(("turn", item.turn_id, line, item))
         for state in states:
-            lines.append(
-                f"[STATE {state.state_id} r{state.revision} {state.status.value}] "
-                f"{state.subject_id}.{state.attribute}={state.value} scope={state.scope}"
-            )
+            candidates.append(("state", state.state_id,
+                f"[STATE {state.state_id} r{state.revision} {state.status.value}] {state.subject_id}.{state.attribute}={state.value} scope={state.scope}", state))
         for episode in episodes:
-            lines.append(
-                f"[EPISODE {episode.episode_id}] {episode.title}: {episode.summary}"
-            )
-        for relation in relations:
-            lines.append(
-                f"[RELATION {relation.edge_id}] {relation.source_episode_id} --"
-                f"{self._relation_label(relation)}--> {relation.target_episode_id}"
-            )
-        # A conservative approximation that keeps all providers under the same budget.
-        char_budget = self.config.context_token_budget * 4
-        output: list[str] = []
-        used = 0
-        for line in lines:
-            if used + len(line) + 1 > char_budget:
-                break
-            output.append(line)
-            used += len(line) + 1
-        return "\n".join(output)
+            candidates.append(("episode", episode.episode_id,
+                f"[EPISODE {episode.episode_id}] {episode.title}: {episode.summary}", episode))
+        if self.config.include_relation_context:
+            for relation in relations:
+                candidates.append(("relation", relation.edge_id,
+                    f"[RELATION {relation.edge_id}] {relation.source_episode_id} --{self._relation_label(relation)}--> {relation.target_episode_id}", relation))
+        candidates = [
+            (kind, identifier, line.replace("\r", "\\r").replace("\n", "\\n"), item)
+            for kind, identifier, line, item in candidates
+        ]
+        chosen: list[tuple[str, str, str, object]] = []
+        excluded: dict[str, list[str]] = {"turn": [], "state": [], "episode": [], "relation": []}
+        for candidate in candidates:
+            proposed = "\n".join([item[2] for item in chosen] + [candidate[2]])
+            if self.token_counter.count(proposed) <= self.config.context_token_budget:
+                chosen.append(candidate)
+            elif candidate[0] in excluded:
+                excluded[candidate[0]].append(candidate[1])
+        raw = sorted((item for item in chosen if item[0] == "turn"), key=lambda x: (x[3].observed_at, x[3].conversation_id, x[1]))
+        displayed = raw + [item for item in chosen if item[0] != "turn"]
+        context = "\n".join(item[2] for item in displayed)
+        while displayed and self.token_counter.count(context) > self.config.context_token_budget:
+            removed = displayed.pop()
+            if removed[0] in excluded:
+                excluded[removed[0]].append(removed[1])
+            context = "\n".join(item[2] for item in displayed)
+        chosen = displayed
+        raw = [item for item in displayed if item[0] == "turn"]
+        turns = [item[3] for item in raw]
+        return context, {
+            "context_turn_ids": tuple(item.turn_id for item in turns),
+            "context_turn_refs": tuple(f"{item.conversation_id}:{item.turn_id}" for item in turns),
+            "context_event_ids": tuple(eid for item in turns for eid in item.event_ids),
+            "context_state_ids": tuple(item[1] for item in chosen if item[0] == "state"),
+            "context_episode_ids": tuple(item[1] for item in chosen if item[0] == "episode"),
+            "context_relation_ids": tuple(item[1] for item in chosen if item[0] == "relation"),
+            "excluded_state_ids": tuple(excluded["state"]),
+            "excluded_turn_ids": tuple(excluded["turn"]),
+            "excluded_episode_ids": tuple(excluded["episode"]),
+            "excluded_relation_ids": tuple(excluded["relation"]),
+            "memory_token_count": self.token_counter.count(context),
+            "token_count_method": self.token_counter.name,
+        }

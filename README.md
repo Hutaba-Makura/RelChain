@@ -32,11 +32,18 @@ relchain locomo `
   --db data/locomo_qwen3_8b_sample0.db `
   --output results/locomo_qwen3_8b_sample0.jsonl `
   --relation-mode hybrid `
+  --common-artifact results/sample0.common.json `
+  --relation-generation llm `
   --base-url http://localhost:8000/v1 `
-  --model Qwen/Qwen3-8B
+  --model Qwen/Qwen3-8B `
+  --relation-model Qwen/Qwen3-8B `
+  --tokenizer C:/models/Qwen3-8B `
+  --full-input-tokens 8192
 ```
 
-最初は `--max-questions 3` でsmoke testし、その後オプションを外すとsample 0の199問を再開可能なJSONLとして保存します。
+`--common-artifact` の初回実行では、固定方式の共通構築DBと凍結成果物を作り、指定方式のDBへ複製します。Free / Hybridで自由関係名のLLM生成を検証するには `--relation-generation llm` を指定します。Fixedでは関係名生成LLMを呼びません。`--max-questions 3` で小さく試し、同じ条件でオプションを外すと成功済み質問を飛ばして再開します。モデルや予算などを変えると別runになります。
+
+`--tokenizer` はローカルに保存された回答モデル用Transformers tokenizerです。`--full-input-tokens` を使う場合は必須です。`transformers` のインストールが必要です。サーバー側のチャット形式がローカルtokenizerと異なる場合、その差は計測対象外です。
 
 入力は1行1発話の JSON Lines です。
 
@@ -53,10 +60,10 @@ relchain locomo `
 - ADD / SUPPORT / COEXIST / SUPERSEDE / RETRACT / HOLD の状態更新
 - Episode・User State の並列検索、有限ホップ探索、原文への遡及
 - 根拠IDと不確実性を返す回答生成
-- 検索トレース、Relation 統計、QA F1、Evidence Recall の評価
+- 検索トレース、Relation 統計、独自 token_f1、3段階の根拠Recallの評価
 - 依存注入可能な抽出器・Relation生成器・回答器
 - OpenAI互換/ローカル推論サーバー向けJSON LLMアダプタと1回再試行
 
-標準実装はオフラインで動作する決定的なルールベース実装です。研究実験では `llm.py` の検証付きアダプタを各ポートへ注入し、固定した writer / reader LLM を接続できます。
+標準実装のEvent抽出、Episode分割、State抽出、関係名、回答はオフラインの決定的処理です。`locomo` CLIは回答に指定したLLMを使い、関係名は既定で決定的生成です。`--relation-generation llm` を選んだFree / Hybridのみ、別途関係生成LLMを接続します。抽出・分割・State処理は変えません。研究比較の手順、指標、互換性、FakeTransportでの確認方法は [研究実験手順](docs/research-experiment.md) を参照してください。
 
 詳細は [技術スタック](docs/technical-stack.md)、[構成](docs/architecture.md)、[実装プラン](docs/implementation-plan.md)、[各機能](docs/feature-implementation.md)、[テスト](docs/testing.md) を参照してください。

@@ -117,6 +117,9 @@ class Relation(FrozenModel):
     description: str = ""
     evidence_event_ids: tuple[str, ...] = ()
     confidence: float = Field(default=1.0, ge=0.0, le=1.0)
+    candidate_id: str = ""
+    candidate_confidence: float | None = None
+    generation_confidence: float | None = None
     symmetric: bool = False
     status: str = "active"
 
@@ -183,8 +186,10 @@ class QueryIntent(FrozenModel):
 
 
 class EvidenceItem(FrozenModel):
+    conversation_id: str = ""
     turn_id: str
     event_id: str
+    event_ids: tuple[str, ...] = ()
     episode_id: str
     speaker_id: str
     observed_at: datetime
@@ -203,6 +208,20 @@ class RetrievalTrace(FrozenModel):
     evidence_event_ids: tuple[str, ...]
     evidence_turn_ids: tuple[str, ...]
     relation_descriptions: tuple[str, ...]
+    context_event_ids: tuple[str, ...] = ()
+    context_turn_ids: tuple[str, ...] = ()
+    context_state_ids: tuple[str, ...] = ()
+    context_episode_ids: tuple[str, ...] = ()
+    context_relation_ids: tuple[str, ...] = ()
+    excluded_state_ids: tuple[str, ...] = ()
+    excluded_episode_ids: tuple[str, ...] = ()
+    excluded_relation_ids: tuple[str, ...] = ()
+    memory_token_count: int = 0
+    token_count_method: str = "approximate"
+    inspected_edge_ids: tuple[str, ...] = ()
+    retrieved_turn_refs: tuple[str, ...] = ()
+    context_turn_refs: tuple[str, ...] = ()
+    excluded_turn_ids: tuple[str, ...] = ()
 
 
 class RetrievalResult(FrozenModel):
@@ -220,6 +239,13 @@ class Answer(FrozenModel):
     evidence_event_ids: tuple[str, ...]
     uncertainty: str | None = None
     retrieval: RetrievalResult
+    raw_response: str | None = None
+    model_cited_event_ids: tuple[str, ...] = ()
+    invalid_cited_event_ids: tuple[str, ...] = ()
+    citation_status: str = "not_applicable"
+    response_status: str = "answered"
+    prompt_token_count: int | None = None
+    prompt_token_method: str | None = None
 
 
 class IngestReport(FrozenModel):

@@ -22,7 +22,8 @@ from .models import (
     SourceSpan,
     StateCandidate,
 )
-from .text import jaccard, stable_id, tokenize
+from .text import stable_id
+from .tokens import ApproximateTokenCounter, TokenCounter
 
 T = TypeVar("T")
 
@@ -303,6 +304,7 @@ class _RelationResponse(BaseModel):
 
 
 class LLMRelationTextGenerator:
+    PROMPT_VERSION = "relation-text-v1"
     def __init__(self, caller: ValidatedJSONCaller) -> None:
         self.caller = caller
 
@@ -346,67 +348,130 @@ class _AnswerResponse(BaseModel):
     answer: str
     evidence_event_ids: tuple[str, ...]
     uncertainty: str | None = None
+    status: str = "answered"
 
 
 class LLMAnswerGenerator:
-    def __init__(self, caller: ValidatedJSONCaller) -> None:
-        self.caller = caller
+    PROMPT_VERSION = "answer-multi-citation-v2"
+    SYSTEM_MESSAGE = "Return only valid JSON matching the requested schema. Do not add facts absent from the supplied evidence."
 
-    def generate(self, retrieval: RetrievalResult) -> Answer:
-        allowed_events = set(retrieval.trace.evidence_event_ids)
-        allowed_event_list = sorted(allowed_events)
-        prompt = f"""Answer the question using only the supplied memory context.
+    def __init__(
+        self, caller: ValidatedJSONCaller, *, token_counter: TokenCounter | None = None,
+        full_input_token_budget: int | None = None,
+    ) -> None:
+        self.caller = caller
+        self.token_counter = token_counter or ApproximateTokenCounter()
+        self.full_input_token_budget = full_input_token_budget
+
+    def _prompt(self, retrieval: RetrievalResult) -> str:
+        allowed_event_list = sorted(retrieval.trace.context_event_ids)
+        return f"""Answer the question using only the supplied memory context.
 Prefer raw turns over summaries. Distinguish current, past, explicit, inferred, and uncertain.
 Give only the concise answer, normally a date, name, or short phrase; do not restate the
 question or add merely plausible options. Resolve relative dates such as yesterday and
 last year against the ISO timestamp on the TURN line, returning an absolute date or year
-when the question asks when. Cite exactly one best EVENT identifier verbatim from
-allowed_evidence_event_ids whenever the answer is not empty.
-Schema: {{"answer":"...","evidence_event_ids":[],"uncertainty":null}}
+when the question asks when. Cite every EVENT needed to support the answer, and no
+unsupported EVENT. If no answer is supported, return status information_not_found,
+an empty answer and no citations.
+Schema: {{"answer":"...","evidence_event_ids":[],"uncertainty":null,"status":"answered|information_not_found"}}
 question={json.dumps(retrieval.question, ensure_ascii=False)}
 allowed_evidence_event_ids={json.dumps(allowed_event_list)}
 context={retrieval.context}"""
 
-        def validate(data: Any) -> _AnswerResponse:
-            response = _AnswerResponse.model_validate(data)
-            valid_ids = tuple(
-                event_id
-                for event_id in response.evidence_event_ids
-                if event_id in allowed_events
-            )
-            if valid_ids != response.evidence_event_ids:
-                response = response.model_copy(update={"evidence_event_ids": valid_ids})
-            if response.answer and not valid_ids and allowed_events:
-                # Small local readers occasionally omit the citation array even when
-                # their answer is grounded in the supplied context.  Recover the most
-                # lexically compatible source instead of discarding the whole answer.
-                answer_tokens = tokenize(response.answer)
-                best = max(
-                    retrieval.evidence,
-                    key=lambda item: jaccard(answer_tokens, tokenize(item.raw_text)),
-                )
-                response = response.model_copy(
-                    update={"evidence_event_ids": (best.event_id,)}
-                )
-            return response
+    def _input_count(self, prompt: str) -> tuple[int, str]:
+        chat_counter = getattr(self.token_counter, "count_chat", None)
+        if chat_counter is not None:
+            return chat_counter(self.SYSTEM_MESSAGE, prompt), self.token_counter.name + ":chat_template"
+        serialized = json.dumps([
+            {"role": "system", "content": self.SYSTEM_MESSAGE},
+            {"role": "user", "content": prompt},
+        ], ensure_ascii=False)
+        return self.token_counter.count(serialized), self.token_counter.name + ":serialized_chat_approximation"
 
-        response = self.caller.call(prompt, validate)
+    def _fit_prompt(self, retrieval: RetrievalResult) -> tuple[RetrievalResult, str, int, str]:
+        current = retrieval
+        while True:
+            prompt = self._prompt(current)
+            count, method = self._input_count(prompt)
+            retry_count, _ = self._input_count(prompt + "\nYour previous output was invalid. Correct the citations using only allowed_evidence_event_ids.")
+            if self.full_input_token_budget is None or max(count, retry_count) <= self.full_input_token_budget:
+                return current, prompt, count, method
+            lines = current.context.splitlines()
+            if not lines:
+                raise ValueError("fixed answer prompt exceeds full_input_token_budget")
+            lines.pop()
+            context = "\n".join(lines)
+            trace = current.trace
+            turns = tuple(item for item in current.evidence if any(
+                line.startswith(f"[TURN {item.turn_id} EVENTS ") for line in lines
+            ))
+            trace = trace.model_copy(update={
+                "context_turn_ids": tuple(item.turn_id for item in turns),
+                "context_turn_refs": tuple(f"{item.conversation_id}:{item.turn_id}" for item in turns),
+                "context_event_ids": tuple(eid for item in turns for eid in item.event_ids),
+                "context_state_ids": tuple(x for x in trace.context_state_ids if f"[STATE {x} " in context),
+                "context_episode_ids": tuple(x for x in trace.context_episode_ids if f"[EPISODE {x}]" in context),
+                "context_relation_ids": tuple(x for x in trace.context_relation_ids if f"[RELATION {x}]" in context),
+                "excluded_turn_ids": trace.excluded_turn_ids + tuple(x for x in trace.context_turn_ids if not any(t.turn_id == x for t in turns)),
+                "excluded_state_ids": trace.excluded_state_ids + tuple(x for x in trace.context_state_ids if f"[STATE {x} " not in context),
+                "excluded_episode_ids": trace.excluded_episode_ids + tuple(x for x in trace.context_episode_ids if f"[EPISODE {x}]" not in context),
+                "excluded_relation_ids": trace.excluded_relation_ids + tuple(x for x in trace.context_relation_ids if f"[RELATION {x}]" not in context),
+                "memory_token_count": self.token_counter.count(context),
+            })
+            current = current.model_copy(update={"context": context, "trace": trace})
+
+    def generate(self, retrieval: RetrievalResult) -> Answer:
+        retrieval, prompt, prompt_count, prompt_method = self._fit_prompt(retrieval)
+        allowed_events = set(retrieval.trace.context_event_ids)
+        raw = ""
+        response: _AnswerResponse | None = None
+        status = "citation_validation_failed"
+        for attempt in range(2):
+            current_prompt = prompt if not attempt else prompt + "\nYour previous output was invalid. Correct the citations using only allowed_evidence_event_ids."
+            if self.full_input_token_budget is not None:
+                retry_count, _ = self._input_count(current_prompt)
+                if retry_count > self.full_input_token_budget:
+                    break
+            prompt_count, prompt_method = self._input_count(current_prompt)
+            response = None
+            raw = self.caller.transport.complete(current_prompt)
+            try:
+                response = _AnswerResponse.model_validate(json.loads(self.caller._strip_fence(raw)))
+            except Exception:
+                continue
+            if response.status == "information_not_found" and not response.answer and not response.evidence_event_ids:
+                status = "valid_abstention"
+                break
+            if response.status == "answered" and response.answer and response.evidence_event_ids and set(response.evidence_event_ids) <= allowed_events:
+                status = "valid"
+                break
+        if response is None:
+            raise ValueError("LLM JSON validation failed after one retry")
+        valid_ids = response.evidence_event_ids if status == "valid" else ()
+        invalid_ids = tuple(eid for eid in response.evidence_event_ids if eid not in allowed_events)
         answer_text = self._normalize_relative_time(
-            retrieval, response.evidence_event_ids, response.answer
+            retrieval, valid_ids, response.answer
         )
         turn_ids = tuple(
             dict.fromkeys(
                 item.turn_id
                 for item in retrieval.evidence
-                if item.event_id in response.evidence_event_ids
+                if set(item.event_ids) & set(valid_ids)
             )
         )
         return Answer(
             text=answer_text,
             evidence_turn_ids=turn_ids,
-            evidence_event_ids=response.evidence_event_ids,
+            evidence_event_ids=valid_ids,
             uncertainty=response.uncertainty,
             retrieval=retrieval,
+            raw_response=raw,
+            model_cited_event_ids=response.evidence_event_ids,
+            invalid_cited_event_ids=invalid_ids,
+            citation_status=status,
+            response_status=response.status,
+            prompt_token_count=prompt_count,
+            prompt_token_method=prompt_method,
         )
 
     @staticmethod
@@ -418,7 +483,7 @@ context={retrieval.context}"""
         if not retrieval.question.lower().strip().startswith("when"):
             return answer
         cited = [
-            item for item in retrieval.evidence if item.event_id in evidence_event_ids
+            item for item in retrieval.evidence if set(item.event_ids) & set(evidence_event_ids)
         ]
         for item in cited:
             raw = item.raw_text.lower()

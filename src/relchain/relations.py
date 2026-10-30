@@ -17,6 +17,10 @@ class RelationCandidate:
     evidence_event_ids: tuple[str, ...]
     confidence: float
 
+    @property
+    def candidate_id(self) -> str:
+        return stable_id("candidate", self.source.episode_id, self.target.episode_id, self.category.value)
+
 
 class DeterministicRelationTextGenerator:
     def free_relation(
@@ -24,12 +28,7 @@ class DeterministicRelationTextGenerator:
     ) -> tuple[str, str, float]:
         left = snake_case(source.topic, "source_topic")
         right = snake_case(target.topic, "target_topic")
-        verb = {
-            RelationCategory.TEMPORAL: "preceded",
-            RelationCategory.CAUSAL: "contributed_to",
-            RelationCategory.SEMANTIC: "shares_context_with",
-        }[category_hint]
-        return f"{left}_{verb}_{right}", f"{source.title} -> {target.title}", 0.75
+        return f"{left}_context_to_{right}", f"{source.title} -> {target.title}", 0.75
 
     def hybrid_relation(
         self, source: Episode, target: Episode, category: RelationCategory
@@ -128,10 +127,11 @@ class RelationBuilder:
         return list(candidates.values())
 
     def build(
-        self, episodes: Sequence[Episode], events: dict[str, Event]
+        self, episodes: Sequence[Episode], events: dict[str, Event],
+        candidates: Sequence[RelationCandidate] | None = None,
     ) -> list[Relation]:
         relations: list[Relation] = []
-        for candidate in self.candidate_pairs(episodes, events):
+        for candidate in candidates if candidates is not None else self.candidate_pairs(episodes, events):
             mode = self.config.relation_mode
             if mode == RelationMode.FIXED:
                 relation_text = {
@@ -142,20 +142,22 @@ class RelationBuilder:
                 category: RelationCategory | None = candidate.category
                 description = relation_text
                 confidence = candidate.confidence
+                generation_confidence = None
             elif mode == RelationMode.FREE:
-                relation_text, description, confidence = (
+                relation_text, description, generation_confidence = (
                     self.text_generator.free_relation(
                         candidate.source, candidate.target, candidate.category
                     )
                 )
                 category = None
             else:
-                relation_text, description, confidence = (
+                relation_text, description, generation_confidence = (
                     self.text_generator.hybrid_relation(
                         candidate.source, candidate.target, candidate.category
                     )
                 )
                 category = candidate.category
+            confidence = candidate.confidence if self.config.confidence_policy == "common" else min(candidate.confidence, generation_confidence if generation_confidence is not None else candidate.confidence)
             edge_id = stable_id(
                 "relation",
                 candidate.source.episode_id,
@@ -173,7 +175,10 @@ class RelationBuilder:
                     relation_text=relation_text,
                     description=description,
                     evidence_event_ids=candidate.evidence_event_ids,
-                    confidence=min(candidate.confidence, confidence),
+                    confidence=confidence,
+                    candidate_id=candidate.candidate_id,
+                    candidate_confidence=candidate.confidence,
+                    generation_confidence=generation_confidence,
                     symmetric=candidate.category == RelationCategory.SEMANTIC,
                 )
             )

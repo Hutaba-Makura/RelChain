@@ -21,6 +21,7 @@ from .relations import RelationBuilder
 from .retrieval import MemoryRetriever
 from .state import StateUpdater
 from .storage import SQLiteMemoryStore
+from .tokens import TokenCounter
 
 
 class MemorySystem:
@@ -35,6 +36,7 @@ class MemorySystem:
         episode_annotator: EpisodeAnnotator | None = None,
         relation_text_generator: RelationTextGenerator | None = None,
         answer_generator: AnswerGenerator | None = None,
+        token_counter: TokenCounter | None = None,
     ) -> None:
         self.config = config or MemoryConfig()
         self.store = SQLiteMemoryStore(database)
@@ -61,7 +63,7 @@ class MemorySystem:
             self.embedder, self.config, relation_text_generator
         )
         self.state_updater = StateUpdater(self.store, self.config)
-        self.retriever = MemoryRetriever(self.store, self.embedder, self.config)
+        self.retriever = MemoryRetriever(self.store, self.embedder, self.config, token_counter)
         self.answer_generator = answer_generator or EvidenceExtractiveAnswerGenerator()
 
     def ingest(self, turns: Sequence[ConversationTurn]) -> IngestReport:
@@ -73,14 +75,17 @@ class MemorySystem:
             existing = self.store.get_turn(turn.conversation_id, turn.turn_id)
             if existing is not None:
                 self.store.save_turn(turn)  # validates append-only equality
-                continue
+                if self.store.has_events_for_turn(turn.conversation_id, turn.turn_id):
+                    continue
             try:
-                self.store.save_turn(turn)
+                if existing is None:
+                    self.store.save_turn(turn)
                 events = self.event_extractor.extract(turn)
                 if not events:
                     raise ValueError("extractor returned no grounded events")
                 self.store.save_events(events)
-                new_turn_ids.append(turn.turn_id)
+                if existing is None:
+                    new_turn_ids.append(turn.turn_id)
                 new_event_ids.extend(item.event_id for item in events)
                 affected_conversations.add(turn.conversation_id)
             except Exception as exc:
@@ -99,8 +104,11 @@ class MemorySystem:
 
         all_events = {item.event_id: item for item in self.store.list_events()}
         all_episodes = self.store.list_episodes()
-        relations = self.relation_builder.build(all_episodes, all_events)
-        self.store.replace_relations(self.config.relation_mode.value, relations)
+        if new_event_ids or (all_episodes and not self.store.list_relations()):
+            relations = self.relation_builder.build(all_episodes, all_events)
+            self.store.replace_relations(self.config.relation_mode.value, relations)
+        else:
+            relations = self.store.list_relations()
 
         changed_states: list[str] = []
         transitions: list[StateTransition] = []

@@ -307,6 +307,14 @@ class SQLiteMemoryStore:
             ).fetchone()
         return None if row is None else self._parse(ConversationTurn, row["data_json"])
 
+    def has_events_for_turn(self, conversation_id: str, turn_id: str) -> bool:
+        with self.connect() as con:
+            row = con.execute(
+                "SELECT 1 FROM events WHERE conversation_id=? AND turn_id=? LIMIT 1",
+                (conversation_id, turn_id),
+            ).fetchone()
+        return row is not None
+
     def get_event(self, event_id: str) -> Event | None:
         with self.connect() as con:
             row = con.execute(
